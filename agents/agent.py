@@ -8,11 +8,12 @@ class AgentNode:
         self.name = name
         self.role = role
         self.system_prompt = SUPERVISOR_PROMPT if role =="supervisor" else WORKER_PROMPT
-        self.llm = llm if llm else None
+        self.llm = llm
         self.config = {"timeout":300, "max_retries":3}
         if self.role == "worker":
             self.tools = tools or []
-            self.llm = llm.bind_tools(self.tools)
+            if self.tools:
+                self.llm = llm.bind_tools(self.tools)
         if self.role == "supervisor":
             self.tools = {}
             self.agents_info = agents_info
@@ -38,7 +39,8 @@ class AgentNode:
                 task_id=task.id,
                 node=task.node,
                 task_description=task.description,
-                available_tools=", ".join(tool_names)
+                available_tools=", ".join(tool_names),
+                result_storage = state["result_storage"]
             )
             prompt = [
                 SystemMessage(content=system_prompt),
@@ -61,24 +63,29 @@ class AgentNode:
         return formatted.strip()
     def _parse_output(self, response):
         raw = response.content
+        start_idx = raw.find('{')
+        end_idx = raw.rfind('}')
         
+        if start_idx == -1 or end_idx == -1:
+            raise ValueError(f"No JSON object found in output: {raw}")
+        
+        clean_json = raw[start_idx:end_idx+1]
         # Strip markdown fence nếu LLM wrap trong ```json ... ```
-        if raw.strip().startswith("```"):
-            raw = (
-                raw.strip()
+        if clean_json.strip().startswith("```"):
+            clean_json = (
+                clean_json.strip()
                 .removeprefix("```json")
                 .removeprefix("```")
                 .removesuffix("```")
                 .strip()
             )
-        
         try:
             if self.role == "supervisor":
-                return SupervisorOutput.model_validate_json(raw)
+                return SupervisorOutput.model_validate_json(clean_json)
             else:
-                return WorkerOutput.model_validate_json(raw)
+                return WorkerOutput.model_validate_json(clean_json)
         except Exception as e:
-            raise ValueError(f"[{self.name}] Failed to parse LLM output: {e}\nRaw: {raw}")
+            raise ValueError(f"[{self.name}] Failed to parse LLM output: {e}\nRaw: {clean_json}")
     def _invoke(self, state:State):
         prompt = self._format_prompt(state)
         response = self.llm.invoke(prompt)

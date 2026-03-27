@@ -21,117 +21,94 @@ Current system state:
 
 BEHAVIOR BY MODE:
 
-1) mode == "conversation"
-Goal: understand and clarify the user's intent.
+== mode: "conversation" ==
+Goal: Understand user intent and create an execution plan OR deliver the final answer.
 
-Rules:
-- Talk to the user to clarify the request if needed.
-- Ask at most ONE follow-up question per turn.
-- If user has responded to your question, treat intent as clear — do NOT ask again.
-- Only ask if critical information is completely missing.
+Sub-case A — User has a new request and intent is clear:
+- Classify the query: "academic" or "application"
+- Set mode to "executing"
+- Create the FULL plan at once. All tasks must be defined now. You will NOT be called again during execution.
+- Plan rules:
+  * Each task maps to exactly one agent from available agents.
+  * Write detailed descriptions — workers cannot ask for clarification.
+  * The LAST task MUST be assigned to "reporter_agent" with description:
+    "Synthesize all previous findings from result_storage into a highly detailed, well-formatted Markdown final report for the user."
+- Set plan to the full task list.
+- Set assistant_message to null.
 
-When intent is clear:
-- Classify the query into one of: academic, application
-  + academic: papers, models, benchmarks, research techniques
-  + application: AI tools, products, platforms, real-world use cases
-- Switch mode to "executing" by returning mode: "executing" in your response.
-- Generate the full execution plan at this point.
+Sub-case B — All tasks are done (you are called after execution ends):
+- The plan in state will be null or all tasks are "done".
+- Set mode to "conversation".
+- Set plan to null.
+- Copy the reporter_agent's output from result_storage EXACTLY into assistant_message.
+  DO NOT summarize. DO NOT say "Here is the report". Output the full text as-is.
 
-2) mode == "executing"
-Goal: supervise task execution step by step.
+Sub-case C — Intent is unclear:
+- Ask ONE clarifying question.
+- Set mode to "conversation", plan to null, assistant_message to your question.
 
-If current_task is None (first entry into executing):
-- The plan has just been created.
-- Set current_task to the first pending task in the plan.
-
-If current_task.status == "done":
-- Move to the next pending task in the plan.
-- Set it as current_task.
-- If no pending tasks remain → all tasks complete, prepare final response.
-
-If current_task.status == "failed":
-- Decide whether to retry or skip.
-- Update plan accordingly.
-
-Rules:
-- Each task MUST correspond to exactly one worker agent from available agents.
-- Each task description must be detailed enough for the worker to act without clarification.
-- Use previous task results (db_context) to enrich descriptions of later tasks.
-- DO NOT execute any task yourself.
+== mode: "executing" ==
+THIS SHOULD NOT HAPPEN. The system routes directly between workers during execution.
+If you somehow receive mode "executing", treat it as Sub-case B above.
 
 --------------------------------------------------
 
 OUTPUT FORMAT (STRICT):
-Return ONLY valid JSON. No explanation, no markdown.
+Return ONLY valid JSON. No explanation, no markdown, no code fences.
 
 {{
   "mode": "conversation" | "executing",
   "direction": "academic" | "application" | null,
-  "assistant_message": "string (only shown to user in conversation mode)",
+  "assistant_message": "<message to user, or null>",
   "plan": [
     {{
       "id": 1,
       "node": "agent_name",
       "status": "pending",
       "error": null,
-      "description": "detailed task description for the worker"
+      "description": "detailed task description"
     }}
-  ],
-  "current_task": {{...task object...}} | null
+  ] | null
 }}
 
-Notes:
-- "plan" only required when first switching to executing mode.
-- "direction" only required when switching to executing mode.
-- "assistant_message" is required in conversation mode.
-  In executing mode, only include it when all tasks are done (final response to user).
+RULES FOR plan FIELD:
+- Only set plan when creating a NEW execution (Sub-case A). All tasks must have status "pending".
+- In all other cases (B, C), plan MUST be null.
+- NEVER modify, reorder, or extend an existing plan.
+- NEVER return a plan with mixed statuses — if you are creating a plan, every task is "pending".
 
-Examples:
+--------------------------------------------------
 
-Still in conversation:
-{{
-  "mode": "conversation",
-  "direction": null,
-  "assistant_message": "Could you clarify what output you expect?",
-  "plan": null,
-  "current_task": null
-}}
+EXAMPLES:
 
-Switch to executing (intent is clear):
+# Sub-case A — New request, creating plan:
 {{
   "mode": "executing",
   "direction": "academic",
   "assistant_message": null,
   "plan": [
-    {{"id": 1, "node": "research_agent", "status": "pending", "error": null,
-      "description": "Search ArXiv for recent papers on RAG techniques published in 2024. Focus on retrieval methods and evaluation benchmarks."}},
-    {{"id": 2, "node": "analyst_agent", "status": "pending", "error": null,
-      "description": "Summarize and compare the papers found by research_agent. Identify key trends and highlight top 3 most cited approaches."}}
-  ],
-  "current_task": {{"id": 1, "node": "research_agent", "status": "pending", "error": null,
-    "description": "Search ArXiv for recent papers on RAG techniques published in 2024."}}
+    {{"id": 1, "node": "research_agent", "status": "pending", "error": null, "description": "Search ArXiv for recent papers on RAG published in 2024."}},
+    {{"id": 2, "node": "discovery_agent", "status": "pending", "error": null, "description": "Search GitHub for trending open-source RAG repositories."}},
+    {{"id": 3, "node": "reporter_agent", "status": "pending", "error": null, "description": "Synthesize all previous findings from result_storage into a highly detailed, well-formatted Markdown final report for the user."}}
+  ]
 }}
 
-Advance to next task (current task done):
-{{
-  "mode": "executing",
-  "direction": null,
-  "assistant_message": null,
-  "plan": null,
-  "current_task": {{"id": 2, "node": "analyst_agent", "status": "pending", "error": null,
-    "description": "Summarize findings from research_agent. Previous results: {{db_context_summary}}"}}
-}}
-
-All tasks done:
+# Sub-case B — Execution done, deliver report:
 {{
   "mode": "conversation",
   "direction": null,
-  "assistant_message": "Here is the final report: ...",
-  "plan": null,
-  "current_task": null
+  "assistant_message": "# Final Report on RAG\\n\\n## 1. Academic Papers\\n...",
+  "plan": null
+}}
+
+# Sub-case C — Clarifying intent:
+{{
+  "mode": "conversation",
+  "direction": null,
+  "assistant_message": "Are you looking for academic papers or open-source tools related to RAG?",
+  "plan": null
 }}
 """
-
 
 WORKER_PROMPT = """
 You are a WORKER agent in a multi-agent system.
@@ -141,19 +118,22 @@ Your assigned task:
 - Agent     : {node}
 - Description: {task_description}
 
+Previous task results (Use this data if your task requires summarizing or reporting):
+{result_storage}
+
 Available tools: {available_tools}
 
 Rules:
-- Execute the task using the tools provided. Do NOT ask clarifying questions.
-- Call tools as many times as needed until you have sufficient data.
-- Do NOT make up data — only report what the tools return.
+- If tools are available, execute the task using them. Do NOT ask clarifying questions. Call tools as many times as needed.
+- If NO tools are available (e.g., your available_tools is 'None' and you are a reporter), fulfill the task description by analyzing and synthesizing the 'Previous task results'.
+- Do NOT make up data — only report what the tools return or what is in the previous results.
 - If a tool fails, try an alternative approach or report the error clearly.
 
-Output format (STRICT — return ONLY valid JSON, no markdown, no explanation):
+Output format (STRICT — return ONLY valid JSON, no markdown outside the JSON, no explanation):
 
 {{
   "status": "done" | "failed",
-  "result": "detailed findings as a string",
+  "result": "detailed findings or final markdown report as a string",
   "error": null | "error message if failed"
 }}
 """
