@@ -8,7 +8,11 @@ from .agent_registry import AGENT_REGISTRY
 from langgraph.types import Command
 from langgraph.prebuilt import ToolNode
 from langchain_core.messages import ToolMessage, AIMessage
+from dotenv import load_dotenv
+load_dotenv()
+import os
 
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL")
 logger = get_logger("app")
 
 class MultiAgentGraph:
@@ -30,9 +34,8 @@ class MultiAgentGraph:
         if llm is None:
             self.llm = ChatOllama(
                 model="qwen3:8b", 
-                base_url="http://127.0.0.1:11434",
+                base_url=OLLAMA_BASE_URL,
                 temperature=self.config.get("temperature", 0.5),
-                num_ctx=2048,  # Context window size
                 top_k=40,      # Top-K sampling
                 top_p=0.9      # Nucleus sampling
             )
@@ -86,17 +89,26 @@ class MultiAgentGraph:
             logger.info(f"Tools: Created tool for {name} successfully")
         return tool_node_dict
     
+    def _advance_task(self, plan):
+        if plan:
+            return next((t for t in plan if t.status == "pending"), None)
+        return None
+    
     def _supervisor_node(self, state: State) -> Dict:
         """Supervisor node - quyết định mode tiếp theo"""
         try:
             response = self.supervisor._invoke(state)
-            logger.info(f"Supervisor: mode={response.mode}, task={response.current_task.node if response.current_task else None}, messages:{response.assistant_message}")
-            return {
-                "mode": response.mode,
-                "current_task":response.current_task,
-                "plan": response.plan,
+            logger.info(f"Supervisor: mode={response.mode}, messages:{response.assistant_message}")
+            logger.info(f"Plan: {response.plan}")
+            next_task = self._advance_task(response.plan if response.plan else None)
+            update_data = {
+                "mode":response.mode,
+                "current_task": next_task,
                 "messages": [response.assistant_message] if response.assistant_message else []
             }
+            if response.plan:
+                update_data["plan"] = response.plan
+            return update_data
         except Exception as e :
             logger.error(f"Error in supervisor node: {str(e)}", exc_info=True)
             return {
@@ -114,7 +126,7 @@ class MultiAgentGraph:
             current_task: Optional[Task] = state.get("current_task")
             msg = state.get("messages")
             last_msg = msg[-1] if msg else None
-
+            logger.info(f"{worker_name} is doing task: {current_task}")
             if isinstance(last_msg, ToolMessage):
                 response = worker.llm.invoke(msg)
             else:
@@ -125,27 +137,44 @@ class MultiAgentGraph:
             
             current_task.status = "done"
             logger.info(f"Worker {worker_name} complete it's tasks.")
+            plan = state.get("plan", [])
+            for t in plan: 
+                if t.id == current_task.id:
+                    t.status = "done"
+            next_task = self._advance_task(plan)
+            if next_task is None:
+                return Command(
+                    goto = "supervisor",
+                    update={
+                        "current_task": None,
+                        "result_storage":state.get("result_storage", []) + [
+                            {"worker":worker_name, "task_id": current_task.id, "result": response.content}
+                        ]
+                    }
+                )
             return Command(
-                goto="supervisor",
-                update={
-                    "current_task": current_task,
+                goto = f"{next_task.node}",
+                update = {
+                    "current_task": next_task,
                     "result_storage":state.get("result_storage", []) + [
-                        {"worker":worker_name, "task_id": current_task.id, "result": response.content}
+                            {"worker":worker_name, "task_id": current_task.id, "result": response.content}
                     ]
                 }
             )
         except Exception as e:
-            logger.error(f"Error in supervisor node: {str(e)}", exc_info=True)
+            logger.error(f"Error in woker node: {str(e)}", exc_info=True)
             return {
                 "mode": "conversation",
                 "messages": state.get("messages", []) + [f"Error: {str(e)}"]
             }
         
     def _tool_node(self, state:State, agent_name:str):
+        """Tool node thực hiện task bằng tool đã được định nghĩa"""
         node = self.tool_nodes[agent_name]
-        result = node.invoke()
+        result = node.invoke(state)
         tool_messages = result.get("messages", [])
         storage = state.get("result_storage")
+        logger.info(f"{agent_name} is using this tool")
         for msg in tool_messages:
             if hasattr(msg, "content") and isinstance(msg.content, list):
                 storage.extend(msg.content)
@@ -160,12 +189,9 @@ class MultiAgentGraph:
         
         elif mode == "executing":
             task = state.get("current_task")
-            
             if task and task.status == "pending":
                 return task.node 
-            
-            return "supervisor"
-    
+            return END    
         return END  
     def _worker_router(self, state: State, worker_name:str):
         messages = state.get("messages", [])
@@ -177,9 +203,6 @@ class MultiAgentGraph:
         # Có tool_calls → sang tool_node
         if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
             return f"{worker_name}_tools"
-
-        # ToolMessage → quay về worker để LLM xử lý (được handle bởi add_edge tool_node → worker)
-        # AIMessage không có tool_calls → Command đã goto supervisor, router không được gọi
         return END
     def _create_graph(self):
         """Build and compile the multi-agent graph"""
@@ -191,7 +214,10 @@ class MultiAgentGraph:
                 worker_name, 
                 lambda state, wn=worker_name: self._worker_node(state, wn)
             )
-            graph.add_node(f"{worker_name}_tools", self.tool_nodes[worker_name])
+            graph.add_node(
+                f"{worker_name}_tools",
+                lambda state, wn=worker_name: self._tool_node(state, wn)
+            )
             graph.add_edge(f"{worker_name}_tools", f"{worker_name}")
             graph.add_conditional_edges(
                 worker_name,
@@ -241,10 +267,7 @@ class MultiAgentGraph:
         except Exception as e:
             logger.error(f"Invoke error: {str(e)}", exc_info=True)
             return {"status": "error", "error": str(e), "messages": []}
-    def get_architecure(self):
-        img = self.compiled_graph.get_graph().draw_mermaid()
-        with open("graph.mmd", "w") as f:
-            f.write(img)
+
     def get_messages(self):
         if self.current_state.get("messages") == None:
             return
@@ -252,26 +275,3 @@ class MultiAgentGraph:
         print(f"All messages: {messages}")
 
 
-if __name__ == "__main__":
-    graph = MultiAgentGraph(registry=AGENT_REGISTRY)
-    print("Configured workers and tools:")
-    for name, agent in graph.workers.items():
-        tool_list = [t.name for t in agent.tools]
-        print(f" - {name}: {tool_list}")
-    print("\nYou can now type a query.")
-    while True:
-        try:
-            query = input("\nYou: ").strip()
-            if query.lower() in ["exit", "quit", "bye"]:
-                print("Goodbye!")
-                break
-            if not query:
-                continue
-            result = graph.invoke(query)
-            messages = result.get("messages", [])
-            print(f"\nAI: {messages[-1] if messages else 'No response'}")
-        except KeyboardInterrupt:
-            print("\nGoodbye!")
-            break
-        except Exception as e:
-            print(f"Error: {str(e)}")

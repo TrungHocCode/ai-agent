@@ -39,9 +39,9 @@ class State(TypedDict):
 class SupervisorOutput(BaseModel):
     """Schema cho output của Supervisor Node"""
     mode: Literal["conversation", "executing"]  
-    assistant_message: Optional[str] = None
+    assistant_message: Optional[str] = ""
     plan: Optional[List[Task]] = None
-    current_task: Optional[Task] = None
+    direction: Optional[str] = ""
 
 class WorkerOutput(BaseModel):
     """Schema cho output của Worker Node"""
